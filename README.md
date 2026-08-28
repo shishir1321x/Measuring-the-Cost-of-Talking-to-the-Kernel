@@ -1,163 +1,235 @@
-# System Call Optimization: Measuring the User/Kernel Boundary
+# Measuring the Cost of Talking to the Kernel
+### A systems performance study of system call overhead on Linux
 
-A benchmark suite that measures **real system call overhead on a real Linux
-kernel** and demonstrates six ways to reduce it. Unlike a simulation, every
-number here comes from actually executing syscalls and timing them.
+**Author:** Md.Shaiful Alam
+**Repository:** https://github.com/shishir1321x/Measuring-the-Cost-of-Talking-to-the-Kernel
+**Video demo:** [embed link here]
 
-## The one idea behind everything
+---
 
-Your program runs in **user mode** and cannot touch hardware directly. To read a
-file or send a packet it must ask the **kernel**. That request is a **system
-call**, and crossing the boundary is not free — the CPU switches privilege
-levels, saves and restores registers, runs kernel entry/exit code (including
-Spectre/Meltdown mitigations), and pollutes your caches on the way back.
+## 1. Introduction
 
-Measured on this machine: **roughly 265–330 ns per syscall.** Tiny — until you
-make a million of them, which is then a third of a second of pure overhead.
+A program running on Linux is not allowed to touch hardware. To read a file or
+send a packet it must ask the kernel, and that request — a **system call** —
+carries a fixed cost: the CPU switches privilege levels, saves and restores
+state, and runs protected entry/exit code before returning.
 
-> **Every optimization in this project is the same idea in different clothes:
-> do more work per boundary crossing, or don't cross at all.**
+I measured that cost on my machine at **335 nanoseconds per call.** Negligible
+once; ruinous a million times over.
 
-## Quick start
+This project quantifies that overhead and evaluates ten techniques for reducing
+it, from everyday buffering to `io_uring`, the modern batched-submission
+interface. Every figure comes from executing real system calls on a real kernel
+and timing them — nothing is simulated.
+
+The thesis I set out to test was simple:
+
+> **Fewer system calls means faster code.**
+
+The thesis I finished with was more interesting:
+
+> **Fewer system calls means faster code — but only when system calls were
+> actually the bottleneck.** I measured two cases where cutting calls by 15x and
+> 128x produced almost no gain and a net *slowdown* respectively.
+
+## 2. What I built
+
+| Component | Description |
+|---|---|
+| `bench.py` | Benchmark harness: warm-up passes, repeated trials, median reporting, exact syscall accounting. |
+| `experiments.py` | Six baseline experiments (syscall cost, buffering, `writev`, `mmap`, `sendfile`, vDSO). |
+| `iouring.py` | **A from-scratch `io_uring` binding written directly against the raw kernel ABI using `ctypes`** — Python has no standard binding. Implements ring setup, batched submission, and completion reaping. |
+| `advanced.py` | Four advanced experiments including batched I/O and cost decomposition. |
+| `visualize.py` | Generates comparison charts. |
+
+**Headline results** (Linux 6.18, x86-64):
+
+| Technique | Syscalls before → after | Speedup |
+|---|---|---|
+| Buffered writes | 262,146 → 3 | **1282x** |
+| `writev`, small buffers | 8,002 → 502 | 4.3x |
+| `writev`, large buffers | 8,002 → 502 | **1.3x only** |
+| `mmap` vs `read()` loop | 2,051 → 4 | 2.2x |
+| vDSO vs kernel trap | 50,000 → 0 | 7.4x |
+| `io_uring` batching | 2,048 → 16 | **0.3x (slower)** |
+
+The last two rows are the ones I'd defend in interview.
+
+---
+
+## 3. Challenges (STAR)
+
+### Challenge 1 — My benchmark was measuring the wrong thing
+
+**Situation.** My `mmap` experiment reported a 9x speedup over `read()`. The
+number looked great, which is exactly why I distrusted it.
+
+**Task.** I had been comparing an `mmap` loop that touched one byte per 4 KB page
+against a `read()` loop that copied every byte into a user buffer. Both "read the
+file," so I had treated them as equivalent.
+
+**Action.** They were not equivalent — the `mmap` version moved a fraction of the
+data. I rewrote it to copy the same chunks as the `read()` loop, so the *only*
+difference was the syscall. I kept the page-touch variant as a separate row,
+explicitly labelled an upper bound rather than a fair race.
+
+**Result.** The honest speedup was **2.2x**, not 9x. I lost a flattering number
+and gained a defensible one. This changed how I built every later experiment:
+before trusting a result, I now ask what *else* differs between the two sides.
+
+---
+
+### Challenge 2 — A 15x syscall reduction that bought almost nothing
+
+**Situation.** `writev` bundles multiple buffers into one syscall. I expected a
+large win and measured only **1.3x**, despite cutting syscalls 15x.
+
+**Task.** I had been treating "syscall count" as a proxy for "time" — assuming
+that removing calls would proportionally remove cost.
+
+**Action.** Rather than discard the result, I made buffer size the independent
+variable and swept it from 16 bytes to 64 KB, plotting speedup against size.
+
+**Result.** A clean decay curve from **5x down to below 1x**. With small buffers
+the boundary crossing dominates, so removing it wins big; with large buffers the
+data copy dominates and syscall reduction is irrelevant. Past ~32 KB, `writev` is
+marginally *slower*. This became the central finding of the project — and
+reframed it from a list of tricks into a study of when each applies.
+
+---
+
+### Challenge 3 — Writing an `io_uring` binding with no library to lean on
+
+**Situation.** `io_uring` is the natural climax of a syscall-overhead project,
+but Python has no standard binding and I had no `liburing` available.
+
+**Task.** My earlier experiments used ordinary `os` module wrappers. This
+required going a level lower than anything I had written before.
+
+**Action.** I implemented the interface directly against the kernel ABI with
+`ctypes`: invoking `io_uring_setup` by raw syscall number, `mmap`-ing the
+submission and completion rings at their documented offsets, laying out the
+64-byte submission queue entry with `struct.pack_into`, and handling the
+`SINGLE_MMAP` feature flag. I validated correctness by comparing every byte
+returned against `os.pread`.
+
+**Result.** Working batched I/O: **2,048 reads submitted in 16 syscalls**, output
+byte-identical to `pread`. I learned to read kernel documentation as a primary
+source and to verify low-level code against a known-good reference rather than
+trusting that it "looked right."
+
+---
+
+### Challenge 4 — The advanced technique made things *slower*
+
+**Situation.** `io_uring` cut syscalls by 128x and ran at **0.3x the speed** of
+the naive loop it replaced.
+
+**Task.** My instinct was to assume a bug in my ring implementation, since the
+correctness check had passed but the performance was backwards.
+
+**Action.** Instead of guessing, I decomposed the cost: I measured a variant that
+filled ring slots but never submitted them, isolating pure interpreter work from
+kernel work. I also found and fixed a genuine benchmark flaw along the way —
+ring creation (`io_uring_setup` plus several `mmap` calls) was inside the timed
+region, which no real program would do.
+
+**Result.** Filling one ring slot from Python cost **362 ns before any I/O
+occurred** — more than the ~335 ns syscall it eliminated. **Python was spending
+more to avoid the syscall than the syscall cost.** The mechanism was correct;
+the language was the bottleneck. In C, that step is a few stores. This is the
+result I am most pleased with, because the "failure" produced a sharper insight
+than a success would have.
+
+---
+
+### Challenge 5 — My report claimed things my data didn't support
+
+**Situation.** My output printed a conclusion — that `io_uring`'s kernel path was
+faster once interpreter cost was removed — that was true on one machine and
+false on another, where the printed numbers directly contradicted the sentence
+beside them.
+
+**Task.** I had hard-coded interpretations written while looking at one
+particular run.
+
+**Action.** I made the commentary conditional on the measured values, so the
+program compares the figures at runtime and selects claims accordingly. Where a
+result was inconclusive, it now says so and explains what conditions would change
+it.
+
+**Result.** The tool cannot overstate its own findings. I applied the same
+discipline elsewhere: the readahead-hints experiment reports **no measurable
+effect**, states that this means "no effect under these conditions" rather than
+"hints don't work," and gives the command to drop the page cache and retest
+properly. A negative result reported clearly is more valuable than a flattering
+one.
+
+---
+
+### Challenge 6 — It crashed instantly on Windows
+
+**Situation.** `FileNotFoundError: Could not find module 'libc.so.6'` — the code
+died on import for anyone not on Linux.
+
+**Task.** I had hard-coded Linux assumptions throughout: the C library name,
+`writev`, `sendfile`, `clock_gettime`.
+
+**Action.** I added capability detection at startup, with graceful fallbacks and
+a report of what can and cannot be measured on the host. While auditing, I caught
+a second latent bug: `os.open` defaults to *text mode* on Windows, which would
+have silently corrupted binary test data and invalidated every byte count.
+
+**Result.** The suite runs on Windows and macOS with adapted experiments,
+degrading transparently rather than crashing or — worse — reporting corrupted
+numbers as valid. I then ran the full six experiments under WSL2 to obtain the
+complete Linux results.
+
+---
+
+## 4. Skills demonstrated
+
+- **Systems programming:** direct kernel ABI use via `ctypes`; `mmap`, `writev`,
+  `sendfile`, `copy_file_range`, `posix_fadvise`, and a hand-written `io_uring`
+  ring-buffer implementation.
+- **Performance engineering:** warm-up handling, median-of-repeats to reject
+  outliers, cost decomposition to attribute time across layers, and parameter
+  sweeps to locate crossover points.
+- **Experimental rigour:** identifying and correcting unfair comparisons,
+  validating low-level output against known-good references, and reporting
+  negative results.
+- **Scientific honesty:** runtime-conditional conclusions, explicit
+  documentation of confounds (page cache, virtualization, interpreter overhead),
+  and cross-validation between independent methods.
+
+**Cross-validation worth highlighting.** I measured syscall cost two independent
+ways: directly, by timing a `getpid` loop (**335 ns**), and indirectly, by
+dividing time saved by syscalls eliminated in the buffering experiment
+(**303 ns**). Two unrelated methods agreeing within 10% is what convinced me the
+measurements were real rather than noise.
+
+---
+
+## 5. Limitations
+
+- Measurements include Python interpreter overhead. Relative comparisons and
+  syscall counts are exact; absolute timings would be lower in C.
+- Run under WSL2, which taxes syscalls more heavily than bare metal and
+  therefore flatters every optimization here.
+- File I/O is served from the page cache, so these measure syscall and copy
+  overhead rather than storage performance.
+- The `io_uring` binding implements only the operations this benchmark needs and
+  is a teaching implementation, not a production library.
+
+## 6. Reproducing
 
 ```bash
-python3 run_all.py            # run all six experiments
-python3 run_all.py --quick    # smaller workloads, faster
-python3 run_all.py --only 2   # run just experiment 2
-python3 visualize.py          # write charts to ./charts/  (needs matplotlib)
+git clone https://github.com/YOUR-USERNAME/YOUR-REPO
+cd YOUR-REPO
+python3 run_all.py --quick        # six baseline experiments
+python3 run_advanced.py --quick   # io_uring and advanced techniques
+pip install matplotlib && python3 visualize.py
 ```
 
-Requires **Linux** (uses `writev`, `sendfile`, `mmap`, and the vDSO). Pure
-standard library except for the optional charts.
-
-## Files
-
-| File | Role |
-|------|------|
-| `bench.py` | Timing harness: warmup, repeats, medians, syscall accounting. |
-| `experiments.py` | The six experiments, each heavily commented with the theory. |
-| `run_all.py` | Runs everything and prints tables plus interpretation. |
-| `visualize.py` | Three charts (see below). |
-
-## The six experiments
-
-**1. What does one syscall cost?** Times a genuine kernel trap (`getpid` via
-`libc.syscall`, which can't be cached away) against an empty user-space call.
-The difference *is* the boundary cost.
-
-**2. Buffering.** Write 1 MB one byte at a time (262,146 syscalls) versus
-buffered versus a single `write()` (3 syscalls). Same bytes, wildly different
-cost. **This is the biggest and most practical win in the whole project.**
-
-**3. Scatter-gather (`writev`).** Writing several buffers with one syscall
-instead of one per buffer. Tested at both small and large buffer sizes — which
-turns out to matter enormously (see the key finding below).
-
-**4. `mmap`.** Map a file into memory so data arrives via page faults instead of
-`read()` calls. Compared **like-for-like** (both copy the same chunks) so the
-comparison is fair.
-
-**5. `sendfile` (zero-copy).** Copy a file without the bytes ever entering your
-process. `read()+write()` drags every byte into user space and back out;
-`sendfile()` moves it inside the kernel.
-
-**6. The vDSO.** Linux maps a page into every process holding the current time,
-so `clock_gettime()` is answered in **user space with no trap at all**. The
-purest demonstration of the thesis: the fastest syscall is the one you never make.
-
-## Results (Linux 6.18, x86-64, Python 3.12 — re-run on your own machine)
-
-```
-EXPERIMENT 1 — cost of one boundary crossing
-  empty user-space call      24.6 ns/call        0 syscalls
-  real getpid() syscall     289.9 ns/call   50,000 syscalls
-  -> a kernel trap costs ~265 ns more.  1M syscalls = ~265 ms wasted.
-
-EXPERIMENT 2 — buffering (writing the same 1 MB)
-  write() 1 byte at a time   88.66 ms    262,146 syscalls     1.0x
-  buffered, 4KB buffer       12.94 ms         66 syscalls     6.8x
-  buffered, 64KB buffer      12.84 ms          6 syscalls     6.9x
-  single write() of all       0.25 ms          3 syscalls   348.2x
-
-EXPERIMENT 3 — writev, 64-byte buffers
-  16 separate write() calls   3.30 ms      8,002 syscalls     1.0x
-  one writev()                0.87 ms        502 syscalls     3.8x
-EXPERIMENT 3 — writev, 4096-byte buffers
-  16 separate write() calls  34.77 ms      8,002 syscalls     1.0x
-  one writev()               22.44 ms        502 syscalls     1.5x
-
-EXPERIMENT 4 — mmap (32 MB file)
-  read() loop, 4KB buffer     1.20 ms      2,051 syscalls     1.0x
-  mmap + copy same chunks     0.61 ms          4 syscalls     2.0x
-  mmap, touch pages only*     0.13 ms          4 syscalls     9.3x
-
-EXPERIMENT 5 — sendfile (32 MB copy)
-  read()+write() loop, 4KB    9.70 ms      4,100 syscalls     1.0x
-  read()+write() loop, 64KB   5.32 ms        260 syscalls     1.8x
-  sendfile() zero-copy        4.77 ms          6 syscalls     2.0x
-
-EXPERIMENT 6 — vDSO
-  clock_gettime() via vDSO    79.7 ns/call      0 syscalls     3.8x faster
-  getpid() real kernel trap  299.7 ns/call 50,000 syscalls
-```
-
-`*` does strictly less work than the other rows — shown as an upper bound, not a
-fair race.
-
-## The key finding (the part worth writing up)
-
-**Cutting syscalls is not automatically a speedup.** In Experiment 3, `writev`
-reduces syscalls by **15x in both cases** — but delivers **3.8x** with 64-byte
-buffers and only **1.5x** with 4 KB buffers.
-
-The reason: with small buffers, the *boundary crossing* is the dominant cost, so
-removing it wins big. With large buffers, the *data copy* dominates, and no
-amount of syscall reduction touches that.
-
-`charts/cost_vs_size.png` sweeps buffer size from 16 bytes to 64 KB and shows
-the speedup decaying smoothly from ~5x to **below 1x** — past a certain size,
-`writev` is actually slightly *slower*.
-
-**The lesson: measure where the time actually goes before optimizing.** Same
-change, same syscall reduction, radically different payoff depending on context.
-That nuance is what separates a real performance study from a list of tricks.
-
-## Charts
-
-- `buffering.png` — syscall count vs time on log-log axes; a near-straight line
-  showing the direct relationship.
-- `speedups.png` — what each optimization actually buys (log scale, since
-  buffering dwarfs everything).
-- `cost_vs_size.png` — **the most interesting one**: when syscall optimization
-  stops being worth it.
-
-## Measurement caveats (state these in your report)
-
-- These are **Python-level** measurements and include interpreter overhead.
-  Experiment 1 subtracts a baseline to isolate the trap, but absolute numbers
-  would be lower in C. **The relative comparisons and the syscall counts are the
-  trustworthy parts.**
-- Results depend on machine, kernel version, and whether Spectre/Meltdown
-  mitigations are active (they meaningfully increased syscall cost after ~2018).
-  A VM or container will differ from bare metal — this run was in a VM.
-- File I/O here hits the **page cache**, not the disk. These measure syscall and
-  copy overhead, not storage speed. Add `fsync()` or `O_DIRECT` to involve real
-  hardware.
-- Every figure is a median of repeated runs, but a 1-CPU machine is noisier than
-  a quiet multi-core box. Re-run before quoting any absolute number.
-
-## Extension ideas
-
-- **Port the hot loops to C** and re-measure — quantify how much of the cost was
-  Python. This is the single best next step for rigor.
-- **Verify syscall counts empirically** with `strace -c -f python3 run_all.py`
-  instead of counting analytically. (`strace` wasn't available here.)
-- **Add `io_uring`** — the modern Linux interface where you submit *batches* of
-  I/O through shared ring buffers, often with zero syscalls per operation. This
-  is the state of the art and the natural climax of the project.
-- **Measure network syscalls**: `send()` per message vs `sendmmsg()` batching;
-  this is where syscall overhead hurts most in practice.
-- **Show the cache pollution effect**: measure how much slower your *user-space*
-  code runs immediately after a syscall, versus in a tight loop with none.
-- **Sweep against CPU mitigations** (`mitigations=off` at boot, if you control
-  the machine) to isolate how much of the trap cost is Spectre/Meltdown defense.
+Linux required for the full suite; WSL2 works. The scripts report their own
+platform capabilities at startup.
